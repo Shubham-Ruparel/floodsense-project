@@ -13,10 +13,9 @@ app = Flask(__name__)
 # ── STATE ─────────────────────────────────────────────────────
 depth_history        = deque(maxlen=HISTORY_WINDOW)
 time_history         = deque(maxlen=HISTORY_WINDOW)
-last_confirmed_depth = None   # None = no reading yet since server start
+last_confirmed_depth = None
 
 
-# ── HELPERS ───────────────────────────────────────────────────
 def compute_rate_of_rise():
     if len(depth_history) < 2:
         return 0.0
@@ -27,24 +26,28 @@ def compute_rate_of_rise():
     return round(delta_depth / delta_time, 2)
 
 
-# ── ENDPOINTS ─────────────────────────────────────────────────
-
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "FloodSense server running"})
 
 
+@app.route('/reset', methods=['POST'])
+def reset():
+    """
+    Clears all server state.
+    Used between test scenarios so history
+    from previous scenario does not affect next one.
+    In production this endpoint should be removed or protected.
+    """
+    global last_confirmed_depth
+    depth_history.clear()
+    time_history.clear()
+    last_confirmed_depth = None
+    return jsonify({"status": "reset ok"})
+
+
 @app.route('/predict', methods=['POST'])
 def predict():
-    """
-    Accepts either:
-
-    A) Raw profiles from ESP32:
-       { "profiles": [[...], [...], ...] }
-
-    B) Pre-processed distance for testing:
-       { "distance_cm": 495.0 }
-    """
     global last_confirmed_depth
 
     data = request.get_json(silent=True)
@@ -58,14 +61,11 @@ def predict():
         profiles = data["profiles"]
 
         if not isinstance(profiles, list) or len(profiles) == 0:
-            return jsonify({"error": "profiles must be a non-empty list"}), 400
+            return jsonify({"error": "profiles must be non-empty list"}), 400
 
         depth_cm, status = process_10_second_window(profiles)
 
-        # Processing failed — fault or insufficient data
         if depth_cm is None:
-
-            # Submersion = implicit CRITICAL regardless of last depth
             if "SUBMERGED" in status:
                 return jsonify({
                     "alert":               "CRITICAL",
@@ -75,7 +75,6 @@ def predict():
                     "action":              "SENSOR SUBMERGED — flood at sensor height"
                 }), 200
 
-            # All other faults
             return jsonify({
                 "alert":               "SENSOR_FAULT",
                 "reason":              status,
@@ -88,7 +87,6 @@ def predict():
     elif "distance_cm" in data:
         distance_cm = float(data["distance_cm"])
 
-        # Sensor submerged
         if distance_cm < 0:
             return jsonify({
                 "alert":               "CRITICAL",
@@ -98,7 +96,6 @@ def predict():
                 "action":              "SENSOR SUBMERGED — flood at sensor height"
             }), 200
 
-        # Sensor disconnected or miscalibrated
         if distance_cm > SENSOR_HEIGHT_CM + 20:
             return jsonify({
                 "alert":               "SENSOR_FAULT",
@@ -107,11 +104,10 @@ def predict():
                 "next_reading_s":      get_next_interval("SENSOR_FAULT")
             }), 200
 
-        # Object above ground — not water
         if distance_cm < RANGE_GATE_MIN:
             return jsonify({
                 "alert":               "OBJECT_ABOVE_GROUND",
-                "reason":              f"Reflection at {distance_cm}cm — object detected, not water",
+                "reason":              f"Reflection at {distance_cm}cm — object detected not water",
                 "last_known_depth_cm": last_confirmed_depth,
                 "next_reading_s":      get_next_interval("NORMAL")
             }), 200
@@ -144,7 +140,6 @@ def predict():
 
 @app.route('/status', methods=['GET'])
 def status():
-    """Dashboard polling endpoint"""
     if last_confirmed_depth is None:
         return jsonify({
             "message": "No readings received since server start",
@@ -155,12 +150,12 @@ def status():
     alert = get_alert(last_confirmed_depth, rate)
 
     return jsonify({
-        "water_depth_cm":      last_confirmed_depth,
-        "rate_of_rise":        rate,
-        "alert":               alert,
-        "readings_stored":     len(depth_history),
-        "history_cm":          list(depth_history),
-        "history_timestamps":  [int(t) for t in time_history]
+        "water_depth_cm":     last_confirmed_depth,
+        "rate_of_rise":       rate,
+        "alert":              alert,
+        "readings_stored":    len(depth_history),
+        "history_cm":         list(depth_history),
+        "history_timestamps": [int(t) for t in time_history]
     })
 
 
